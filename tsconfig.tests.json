@@ -1,0 +1,48 @@
+{
+	// Typecheck tests/ against product and server source.
+	//
+	// tests/ is included in tsconfig.eslint.json (so typed lint rules can parse
+	// it) but nothing ever ran `tsc` over it, which is how `Promise.withResolvers`
+	// — an ES2024 API absent from Node 20 — reached CI in tests/harness.ts and
+	// failed 93 of 94 suites.
+	//
+	//   npx tsc -noEmit -p tsconfig.tests.json
+	//
+	// `lib` is deliberately pinned to ES2023, NOT ESNext. The rule is that it
+	// tracks the FLOOR of runtimes this repo supports (package.json engines.node
+	// = ">=20"), not whatever CI happens to run — CI is on Node 24, and pinning
+	// lib to CI's version would let an API land that breaks a contributor on the
+	// oldest supported Node. ES2023 is Node 20's ceiling, so ES2024 additions
+	// like Promise.withResolvers are a compile error here. If engines.node ever
+	// rises, raise this with it and not before.
+	//
+	// Note this only constrains contributors and CI: the plugin ships into
+	// Obsidian's bundled Electron runtime and the server runs on Cloudflare
+	// Workers, so there is no production Node to stay compatible with.
+	//
+	// The target/module bump to ES2022 is unavoidable — suites legitimately use
+	// top-level await, which the plugin's ES6 target forbids — but that affects
+	// syntax only, not the available API surface.
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "ESNext",
+		"lib": ["ES2023", "DOM"],
+		"types": ["node", "@cloudflare/workers-types"],
+		"allowImportingTsExtensions": true,
+		// tests/ is the one program that must hold BOTH type universes at once:
+		// client suites need lib.dom, server suites need @cloudflare/workers-types,
+		// and a few suites legitimately import across the boundary. Those two .d.ts
+		// sets contradict each other on WebSocket, MessageEvent and SubtleCrypto,
+		// which produced 64 errors inside node_modules and none in our own code.
+		// skipLibCheck scopes the check to code we actually own, and matches the
+		// root build (`tsc -noEmit -skipLibCheck`) and server/tsconfig.json.
+		"skipLibCheck": true,
+		"noEmit": true
+	},
+	"include": [
+		"src/**/*.ts",
+		"server/src/**/*.ts",
+		"tests/**/*.ts"
+	]
+}

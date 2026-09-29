@@ -1,0 +1,33 @@
+name: YAOS Server Ops
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Choose update or revert"
+        required: true
+        default: "update"
+        type: choice
+        options:
+          - update
+          - revert
+      version:
+        description: "Optional YAOS release tag to install (defaults to latest)"
+        required: false
+        type: string
+      release_repo:
+        description: "Optional owner/repo to pull releases from"
+        required: false
+        default: "kavinsood/yaos"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    uses: kavinsood/yaos/.github/workflows/yaos-ops-reusable.yml@main
+    with:
+      action: ${{ github.event.inputs.action }}
+      version: ${{ github.event.inputs.version }}
+      release_repo: ${{ github.event.inputs.release_repo }}

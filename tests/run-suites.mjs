@@ -1,0 +1,261 @@
+#!/usr/bin/env node
+// Regression test runner. Discovers every suite in tests/ by convention,
+// executes them in sequence, reports pass/fail per suite, and exits non-zero
+// if any suite fails.
+//
+// DISCOVERY, NOT REGISTRATION. A suite is any `*.{ts,mjs}` file inside one of
+// the four suite buckets — tests/client/, tests/server/, tests/contracts/,
+// tests/live/ — that is not named in tests/suites.json. There is no list to
+// append to, because a list that developers must remember to append to loses
+// coverage — this runner replaced one that had silently orphaned two real unit
+// suites (458 + 364 LOC, 146 assertions) for however long nobody noticed.
+//
+// The only hand-maintained data is tests/suites.json, and every entry in it
+// carries a reason string. tests/suite-discovery.ts enforces both halves of
+// that contract: no file may be silently unaccounted for, and no entry may
+// name a path that has since been deleted or renamed.
+//
+// ONE RUNNER FOR ALL. Every suite runs under `node --import jiti/register`.
+// ONE DIALECT FOR ALL. Suites are TypeScript, full stop. tests/run-suites.mjs
+// is the single plain-JS file in tests/ because it is the bootstrap that does
+// the spawning. The old .ts/.mjs split was generational rather than
+// principled, and it cost two bridge files whose only job was to let a .mjs
+// suite reach a .ts module.
+//
+// ONE HARNESS FOR ALL. A suite reports through tests/harness.ts:
+//
+//   import { suite } from "../harness.ts";
+//   const s = suite("my-suite");
+//   s.section("Test 1: …");
+//   s.check(cond, "message");                // boolean form, counted
+//   s.test("name", async () => { … });       // throw form, awaited by done()
+//   await s.done();                          // prints the summary, exits 0/1
+//
+// Do not hand-roll counters, a local assert(), a summary block or a
+// process.exit: `done()` is what makes an unawaited async test body impossible,
+// and a suite that never calls it fails loudly instead of exiting 0 empty.
+//
+// IMPORTANT: Always run regressions via `npm run test:regressions` (or this
+// script directly). Do NOT run individual suites with bare
+// `node --import jiti/register tests/foo.ts` — the JITI_ALIAS env injected
+// below (yjs deduplication, obsidian mock, partyserver mock) will be absent
+// and you may see the "Yjs was already imported" warning or import failures.
+//
+// CLI flags:
+//   --only <substring>   Run only suites whose path contains <substring>.
+//                        Repeatable. May also be passed as --only=<substring>.
+//                        With no --only flags, all suites run.
+//                        If no suite matches, the runner exits non-zero.
+//   --list               Print every suite path the runner knows about (one
+//                        per line) and exit 0 without running anything.
+//                        Honors --only filters when listing.
+//   --help, -h           Print this usage block and exit 0.
+//
+// Unknown flags or positional args cause the runner to exit non-zero with
+// a clear message, so a typo like `--ony` will not silently run the full
+// suite.
+
+import { spawnSync } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ROOT = fileURLToPath(new URL("..", import.meta.url));
+const TESTS_DIR = fileURLToPath(new URL(".", import.meta.url));
+const REGISTRY_PATH = fileURLToPath(new URL("./suites.json", import.meta.url));
+
+// Force all "yjs" imports to resolve to the single root copy, preventing the
+// "Yjs was already imported" constructor-check warning that fires when
+// server/node_modules/yjs and node_modules/yjs are both loaded in the same
+// process (triggered by tests that import from server/src/).
+const ROOT_YJS = fileURLToPath(new URL("../node_modules/yjs/dist/yjs.mjs", import.meta.url));
+
+// Redirect "obsidian" to a minimal runtime mock. The real obsidian package
+// ships only TypeScript declarations (no JS), so any test that imports code
+// depending on obsidian needs this alias to resolve at runtime.
+const OBSIDIAN_MOCK = fileURLToPath(new URL("./mocks/obsidian.ts", import.meta.url));
+
+// Redirect "partyserver" to a minimal runtime mock. The real partyserver
+// imports from "cloudflare:workers" which is unavailable in Node.js.
+// The mock's getServerByName() intentionally throws — any pre-auth code
+// that calls it causes the test to fail loudly (FU-4 invariant).
+const PARTYSERVER_MOCK = fileURLToPath(new URL("./mocks/partyserver.ts", import.meta.url));
+
+// Redirect "@shared/*" to the canonical cross-tree modules. tsc and esbuild
+// resolve this from the `paths` entry in tsconfig.json, but jiti does its own
+// runtime resolution and does not read tsconfig, so the alias has to be
+// restated here. Prefix mapping, so new @shared modules need no change.
+const SHARED_DIR = fileURLToPath(new URL("../server/src/shared", import.meta.url));
+
+const JITI_ENV = {
+	...process.env,
+	JITI_ALIAS: JSON.stringify({
+		yjs: ROOT_YJS,
+		obsidian: OBSIDIAN_MOCK,
+		partyserver: PARTYSERVER_MOCK,
+		"@shared": SHARED_DIR,
+	}),
+};
+
+const RUNNER = ["node", "--import", "jiti/register"];
+
+// -----------------------------------------------------------------------
+// Discovery. Exported so tests/suite-discovery.ts guards the real code path
+// rather than a copy of it that could drift.
+// -----------------------------------------------------------------------
+
+// The four suite buckets. Everything else under tests/ is infrastructure —
+// this runner, suites.json, harness.ts, mocks/, fixtures/ and manual/ — and is
+// not a discovery candidate at all, so it needs no excuse in suites.json.
+const BUCKETS = ["client", "server", "contracts", "live"];
+
+// The suites that cannot live in a bucket: they guard this runner's own
+// discovery functions and the shared assertion harness every bucket suite
+// depends on. Each sits beside the file it verifies and is discovered
+// explicitly rather than by directory walk.
+const ROOT_SUITES = ["tests/harness-self.ts", "tests/suite-discovery.ts"];
+
+/** Every discovery candidate in tests/, repo-root-relative and sorted. */
+export function discoverCandidates() {
+	const bucketed = BUCKETS.flatMap((bucket) =>
+		readdirSync(join(TESTS_DIR, bucket))
+			.filter((name) => name.endsWith(".ts"))
+			.map((name) => `tests/${bucket}/${name}`),
+	);
+	return [...ROOT_SUITES, ...bucketed].sort();
+}
+
+/** tests/suites.json, shape-checked so a malformed edit fails loudly. */
+export function loadRegistry() {
+	const registry = JSON.parse(readFileSync(REGISTRY_PATH, "utf8"));
+	for (const field of ["notSuites", "skip"]) {
+		if (registry[field] === null || typeof registry[field] !== "object" || Array.isArray(registry[field])) {
+			throw new Error(`tests/suites.json: "${field}" must be an object of {path: reason}`);
+		}
+	}
+	if (!Array.isArray(registry.serial)) {
+		throw new Error(`tests/suites.json: "serial" must be an array of paths`);
+	}
+	return registry;
+}
+
+/** Candidates minus non-suites minus deliberate skips. */
+export function discoverSuites(registry = loadRegistry()) {
+	return discoverCandidates().filter(
+		(path) => !(path in registry.notSuites) && !(path in registry.skip),
+	);
+}
+
+// Only act as a CLI when invoked directly, so the guard suite can import the
+// functions above without spawning 90 child processes.
+const invokedDirectly = process.argv[1]
+	&& resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedDirectly) main();
+
+function main() {
+	const registry = loadRegistry();
+	const suites = discoverSuites(registry);
+
+	let totalPassed = 0;
+	let totalFailed = 0;
+
+	// -----------------------------------------------------------------------
+	// CLI argument parsing — fail fast on unknown args, support --only filter.
+	// -----------------------------------------------------------------------
+
+	function printUsage() {
+		console.log("Usage: node tests/run-suites.mjs [--only <substring>]... [--list] [--help]");
+		console.log("");
+		console.log("  --only <substring>   Run only suites whose path contains <substring>.");
+		console.log("                       Repeatable. May also be passed as --only=<substring>.");
+		console.log("  --list               Print every suite path (filtered by --only if given)");
+		console.log("                       and exit without running anything.");
+		console.log("  --help, -h           Print this usage block and exit.");
+	}
+
+	const argv = process.argv.slice(2);
+	const onlyFilters = [];
+	let listOnly = false;
+
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--help" || arg === "-h") {
+			printUsage();
+			process.exit(0);
+		}
+		if (arg === "--list") {
+			listOnly = true;
+			continue;
+		}
+		if (arg === "--only") {
+			const next = argv[i + 1];
+			if (next === undefined || next.startsWith("--")) {
+				console.error(`Error: --only requires a value (e.g. --only frontmatter-guard)`);
+				process.exit(2);
+			}
+			onlyFilters.push(next);
+			i += 1;
+			continue;
+		}
+		if (arg.startsWith("--only=")) {
+			const value = arg.slice("--only=".length);
+			if (value.length === 0) {
+				console.error(`Error: --only requires a non-empty value`);
+				process.exit(2);
+			}
+			onlyFilters.push(value);
+			continue;
+		}
+		console.error(`Error: unknown argument "${arg}"`);
+		console.error("");
+		printUsage();
+		process.exit(2);
+	}
+
+	const selectedSuites = onlyFilters.length === 0
+		? suites
+		: suites.filter((path) => onlyFilters.some((needle) => path.includes(needle)));
+
+	if (onlyFilters.length > 0 && selectedSuites.length === 0) {
+		console.error(`Error: no suite path matched --only filter(s): ${onlyFilters.map((f) => `"${f}"`).join(", ")}`);
+		console.error(`Hint: run with --list to see every known suite path.`);
+		process.exit(2);
+	}
+
+	if (listOnly) {
+		for (const path of selectedSuites) {
+			console.log(path);
+		}
+		process.exit(0);
+	}
+
+	if (onlyFilters.length > 0) {
+		console.log(`Running ${selectedSuites.length} of ${suites.length} suite(s) matching --only filter(s): ${onlyFilters.map((f) => `"${f}"`).join(", ")}`);
+	} else {
+		const skipped = Object.keys(registry.skip).length;
+		const notSuites = Object.keys(registry.notSuites).length;
+		console.log(`Discovered ${suites.length} suite(s) in tests/ (${skipped} skipped, ${notSuites} non-suite file(s); see tests/suites.json).`);
+	}
+
+	for (const suitePath of selectedSuites) {
+		const [cmd, ...cmdArgs] = RUNNER;
+		const result = spawnSync(cmd, [...cmdArgs, suitePath], {
+			cwd: ROOT,
+			stdio: "inherit",
+			env: JITI_ENV,
+		});
+
+		if (result.status === 0) {
+			totalPassed++;
+		} else {
+			totalFailed++;
+			console.error(`\nSUITE FAILED: ${suitePath}\n`);
+		}
+	}
+
+	console.log(`\n${"═".repeat(55)}`);
+	console.log(`Regression suites: ${totalPassed} passed, ${totalFailed} failed`);
+	console.log(`${"═".repeat(55)}\n`);
+
+	process.exit(totalFailed > 0 ? 1 : 0);
+}

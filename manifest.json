@@ -1,0 +1,10 @@
+{
+	"id": "yaos",
+	"name": "YAOS",
+	"version": "2.1.1",
+	"minAppVersion": "1.13.0",
+	"description": "A zero-terminal, real-time sync engine powered by your own Cloudflare Worker.",
+	"author": "Kavin",
+	"authorUrl": "https://github.com/kavinsood",
+	"isDesktopOnly": false
+}
